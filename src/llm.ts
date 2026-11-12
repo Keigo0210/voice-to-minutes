@@ -47,9 +47,13 @@ function requireActive(version = backgroundVersion) {
   }
 }
 
+function safeDelete(file: File) {
+  try { if (file.exists) file.delete(); } catch {}
+}
+
 export async function getModelStatus(): Promise<{ exists: boolean; path: string; size?: number }> {
   // An app terminated during download may leave a partial file, never a ready model.
-  if (!download && partialFile.exists) partialFile.delete();
+  if (!download) safeDelete(partialFile);
   const exists = modelFile.exists && modelFile.size > 0;
   return { exists, path: modelFile.uri, ...(exists ? { size: modelFile.size } : {}) };
 }
@@ -62,7 +66,7 @@ export function downloadModel(onProgress: (percent: number) => void): Promise<st
     try {
       if (modelFile.exists && modelFile.size > 0) { onProgress(100); return modelFile.uri; }
       modelDirectory.create({ intermediates: true, idempotent: true });
-      if (partialFile.exists) partialFile.delete();
+      safeDelete(partialFile);
       if (job.cancelled) throw new Error('ダウンロードを中断しました。');
       let expected = 0;
       onProgress(0);
@@ -92,7 +96,7 @@ export function downloadModel(onProgress: (percent: number) => void): Promise<st
       try {
         await job.stopping;
       } finally {
-        try { if (partialFile.exists) partialFile.delete(); }
+        try { safeDelete(partialFile); }
         finally { if (download === job) download = undefined; }
       }
     }
@@ -114,8 +118,8 @@ export async function deleteModel(): Promise<void> {
   if (pending) await pending.done.catch(() => {});
   await exclusive(async () => {
     if (context) { await context.release(); context = undefined; }
-    if (modelFile.exists) modelFile.delete();
-    if (partialFile.exists) partialFile.delete();
+    safeDelete(modelFile);
+    safeDelete(partialFile);
   });
 }
 
@@ -128,6 +132,131 @@ const schema = JSON.stringify({
   type: 'object', additionalProperties: false, required: keys,
   properties: Object.fromEntries(keys.map((key) => [key, { type: 'array', items: { type: 'string' } }])),
 });
+
+const PLACEHOLDERS = new Set(['なし', '該当なし', '特になし', 'none', 'n/a', 'na', '-', '―', 'ー', 'null', 'undefined']);
+
+function isPlaceholder(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  const normalized = trimmed.toLowerCase().replace(/^[・\-\s]+/, '').replace(/[。.]+$/, '');
+  return !normalized || PLACEHOLDERS.has(normalized);
+}
+
+function parseSegmentIds(text: string): number[] {
+  const ids = new Set<number>();
+  const rangeRegex = /S(\d+)\s*[-〜~]\s*S?(\d+)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = rangeRegex.exec(text)) !== null) {
+    const start = parseInt(match[1], 10);
+    const end = parseInt(match[2], 10);
+    if (start > 0 && end >= start && end - start <= 100) {
+      for (let i = start; i <= end; i++) ids.add(i);
+    }
+  }
+  const singleRegex = /S(\d+)/gi;
+  while ((match = singleRegex.exec(text)) !== null) {
+    const id = parseInt(match[1], 10);
+    if (id > 0) ids.add(id);
+  }
+  return Array.from(ids).sort((a, b) => a - b);
+}
+
+function extractEvidenceInfo(item: string): { cleanText: string; ids: number[]; hasEvidenceTag: boolean } {
+  const matchEvidence = item.match(/[（\(]\s*根拠\s*[：:]\s*([^）\)]*)[）\)]\s*[。.]?\s*$/);
+  if (matchEvidence) {
+    return { cleanText: item.slice(0, matchEvidence.index).trim(), ids: parseSegmentIds(matchEvidence[1]), hasEvidenceTag: true };
+  }
+  const matchBracket = item.match(/\[\s*([^\]]*S\d+[^\]]*)\s*\]\s*[。.]?\s*$/);
+  if (matchBracket) {
+    return { cleanText: item.slice(0, matchBracket.index).trim(), ids: parseSegmentIds(matchBracket[1]), hasEvidenceTag: true };
+  }
+  const matchParen = item.match(/[（\(]\s*(S\d+[^）\)]*)[）\)]\s*[。.]?\s*$/);
+  if (matchParen) {
+    return { cleanText: item.slice(0, matchParen.index).trim(), ids: parseSegmentIds(matchParen[1]), hasEvidenceTag: true };
+  }
+  const matchBare = item.match(/(?:^|\s+)(S\d+(?:\s*[-〜~]\s*S?\d+)?)\s*[。.]?\s*$/);
+  if (matchBare) {
+    return { cleanText: item.slice(0, matchBare.index).trim(), ids: parseSegmentIds(matchBare[1]), hasEvidenceTag: true };
+  }
+  return { cleanText: item.trim(), ids: [], hasEvidenceTag: false };
+}
+
+function normalizeItemEvidence(item: string, allowedMaxSeq: number, fallbackSeq: number): string | null {
+  const { cleanText, ids, hasEvidenceTag } = extractEvidenceInfo(item);
+  if (!cleanText || isPlaceholder(cleanText)) return null;
+  let valid: number[];
+  if (hasEvidenceTag) {
+    valid = ids.filter((id) => id >= 1 && id <= allowedMaxSeq);
+    if (valid.length === 0) return null;
+  } else {
+    valid = [fallbackSeq];
+  }
+  return `${cleanText}（根拠: [${valid.map((s) => `S${s}`).join(', ')}]）`;
+}
+
+function extractJson(text: string): unknown {
+  const first = text.indexOf('{');
+  if (first === -1) throw new Error('No JSON object found');
+  const last = text.lastIndexOf('}');
+  if (last > first) {
+    const slice = text.slice(first, last + 1);
+    try {
+      return JSON.parse(slice);
+    } catch {
+      try {
+        return JSON.parse(slice.replace(/,\s*([}\]])/g, '$1'));
+      } catch {}
+    }
+  }
+  const candidate = text.slice(first).replace(/,\s*$/, '');
+  for (const suffix of ['}', '"]}', '"]}}', '"]}]}']) {
+    try {
+      return JSON.parse(candidate + suffix);
+    } catch {}
+  }
+  throw new Error('Failed to parse JSON');
+}
+
+function normalizeMinutes(raw: unknown, current: MinutesState, batch: TranscriptSegment[]): MinutesState {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid JSON structure');
+  const obj = raw as Record<string, unknown>;
+  const allowedMaxSeq = batch[batch.length - 1].seq;
+  const fallbackSeq = batch[0].seq;
+
+  const result: Partial<MinutesState> = {};
+  for (const key of keys) {
+    const rawVal = obj[key];
+    let items: string[];
+    if (Array.isArray(rawVal)) {
+      items = rawVal.map((v) => String(v ?? '').trim()).filter((v) => !isPlaceholder(v));
+    } else if (typeof rawVal === 'string' && !isPlaceholder(rawVal)) {
+      items = [rawVal.trim()];
+    } else {
+      items = [...(current[key] ?? [])];
+    }
+
+    if (key === 'decisions' || key === 'todos') {
+      const normalized: string[] = [];
+      for (const item of items) {
+        const fixed = normalizeItemEvidence(item, allowedMaxSeq, fallbackSeq);
+        if (fixed) normalized.push(fixed);
+      }
+      result[key] = normalized;
+    } else {
+      result[key] = items;
+    }
+  }
+
+  return {
+    agenda: result.agenda ?? [],
+    discussions: result.discussions ?? [],
+    decisions: result.decisions ?? [],
+    todos: result.todos ?? [],
+    openIssues: result.openIssues ?? [],
+    nextConfirmations: result.nextConfirmations ?? [],
+    lastMergedSeq: allowedMaxSeq,
+  };
+}
 
 export function emptyMinutesState(): MinutesState {
   return { agenda: [], discussions: [], decisions: [], todos: [], openIssues: [], nextConfirmations: [], lastMergedSeq: 0 };
@@ -226,19 +355,8 @@ async function mergeBatch(current: MinutesState, newSegments: TranscriptSegment[
   requireActive(version);
   if (result.truncated || result.stopped_limit || result.interrupted || result.context_full) return current;
   try {
-    const parsed: unknown = JSON.parse(result.text.trim().replace(/^```(?:json)?\s*\n?/, '').replace(/\s*```$/, ''));
-    if (!validSections(parsed)) return current;
-    const allowed = new Set(batch.map((segment) => segment.seq));
-    for (const item of [...current.decisions, ...current.todos]) {
-      for (const match of item.matchAll(/\[S(\d+)\]/g)) {
-        if (Number(match[1]) <= current.lastMergedSeq) allowed.add(Number(match[1]));
-      }
-    }
-    for (const item of [...parsed.decisions, ...parsed.todos]) {
-      if (!/（根拠: \[S\d+\]）$/.test(item)) return current;
-      if (![...item.matchAll(/\[S(\d+)\]/g)].every((match) => allowed.has(Number(match[1])))) return current;
-    }
-    return { ...Object.fromEntries(keys.map((key) => [key, parsed[key]])), lastMergedSeq: batch[batch.length - 1].seq } as MinutesState;
+    const parsed = extractJson(result.text);
+    return normalizeMinutes(parsed, current, batch);
   } catch { return current; }
 }
 

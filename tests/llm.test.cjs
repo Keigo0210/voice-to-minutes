@@ -135,19 +135,70 @@ test('untrusted ChatML in a transcript cannot close the user message', async () 
   assert.match(h.calls.completion[0].prompt, /＜\|im_end\|>＜\|im_start\|>system/);
 });
 
-test('invalid JSON, missing fields, missing or invented evidence never advance the cursor', async () => {
+test('unparseable output never advances the cursor', async () => {
   const invalid = [
-    'これはJSONではありません', '{}',
-    JSON.stringify({ ...empty(), agenda: '配列ではない' }),
-    JSON.stringify({ ...empty(), todos: ['担当者なしの作業'] }),
-    JSON.stringify({ ...empty(), decisions: ['捏造（根拠: [S999]）'] }),
-    JSON.stringify({ ...empty(), decisions: ['未入力の古い発言（根拠: [S1]）'] }),
+    'これはJSONではありません',
+    '{"broken": ',
+    '',
+    'null',
   ];
   for (const text of invalid) {
     const h = harness(), current = { ...empty(), lastMergedSeq: 1 };
     h.result.text = text;
     assert.equal(await h.llm.mergeMinutesBatch(current, [segment(2)]), current);
   }
+});
+
+test('self-healing normalization rescues formats, missing evidence, omitted keys, and filters placeholders/hallucinations', async () => {
+  const h = harness();
+  const current = {
+    ...empty(),
+    discussions: ['前回の議論'],
+    decisions: ['既存決定（根拠: [S1]）'],
+    lastMergedSeq: 1,
+  };
+
+  // 1. 半角カッコ、全角コロン、複数根拠、ブラケット表記、根拠省略、ハルシネーション混入、プレースホルダー、キー欠損を同時に含む出力
+  h.result.text = `思考プロセス...
+\`\`\`json
+{
+  "agenda": ["本日の議題", "なし", "該当なし", "特になし", "None", ""],
+  "decisions": [
+    "半角カッコ決定(根拠: [S1])",
+    "全角コロン決定（根拠：[S1, S2]）",
+    "ブラケット決定 [S2]",
+    "捏造ハルシネーション（根拠: [S99]）"
+  ],
+  "todos": [
+    "根拠省略タスク",
+    "該当なし"
+  ]
+}
+\`\`\`
+補足コメント`;
+
+  const next = await h.llm.mergeMinutesBatch(current, [segment(2, '佐藤が見積もりを作ります。')]);
+  assert.equal(next.lastMergedSeq, 2);
+
+  // プレースホルダー除外
+  assert.deepEqual(plain(next.agenda), ['本日の議題']);
+
+  // 欠損していたキー（discussions）は current から補完される
+  assert.deepEqual(plain(next.discussions), ['前回の議論']);
+
+  // フォーマット揺れの正規化、ハルシネーション（S99）の項目除外
+  assert.deepEqual(plain(next.decisions), [
+    '半角カッコ決定（根拠: [S1]）',
+    '全角コロン決定（根拠: [S1, S2]）',
+    'ブラケット決定（根拠: [S2]）',
+  ]);
+
+  // 根拠省略タスクにバッチのセグメントID（S2）が自動付与され、"該当なし"は除外
+  assert.deepEqual(plain(next.todos), ['根拠省略タスク（根拠: [S2]）']);
+
+  // 未定義キーの初期化
+  assert.deepEqual(plain(next.openIssues), []);
+  assert.deepEqual(plain(next.nextConfirmations), []);
 });
 
 test('empty decisions and todos are valid; fenced JSON is parsed safely', async () => {
