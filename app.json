@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "VoiceToMinutes",
+    "slug": "voice-to-minutes",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.keigo.voicetominutes",
+      "infoPlist": {
+        "UIBackgroundModes": ["audio"],
+        "NSMicrophoneUsageDescription": "会議の録音とリアルタイム文字起こしのためにマイクを使用します。",
+        "NSSpeechRecognitionUsageDescription": "録音した音声を端末内でリアルタイムに文字起こしするために音声認識を使用します。"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      ["expo-speech-recognition", {
+        "microphonePermission": "会議の録音とリアルタイム文字起こしのためにマイクを使用します。",
+        "speechRecognitionPermission": "録音した音声を端末内でリアルタイムに文字起こしするために音声認識を使用します。"
+      }],
+      "expo-audio",
+      "expo-sqlite",
+      "llama.rn"
+    ]
+  }
+}
